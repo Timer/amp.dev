@@ -1,5 +1,5 @@
 /**
- * Copyright 2020 The AMP HTML Authors. All Rights Reserved.
+ * Copyright 2018 The AMP HTML Authors. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,136 +16,192 @@
 
 'use strict';
 
-const Joi = require('joi');
 const express = require('express');
-const log = require('@lib/utils/log')('Survey Component Response');
-const credentials = require('@lib/utils/credentials');
-const {GoogleSpreadsheet} = require('google-spreadsheet');
-const surveyEndpoint = '/fez-survey-response';
-let Doc = undefined;
-let SURVEY_RESPONSE_SHEET_ID;
-let GOOGLE_SERVICE_ACCOUNT_EMAIL;
-let GOOGLE_PRIVATE_KEY;
+const shrinkRay = require('shrink-ray-current');
+const cors = require('cors');
+const ampCors = require('@ampproject/toolbox-cors');
+const config = require('./config.js');
+const {pagePath} = require('@lib/utils/project');
+const log = require('@lib/utils/log')('Platform');
+const subdomain = require('./middleware/subdomain.js');
+const webSocketServer = require('@examples/socket-server/socket-server');
 
-const schema = Joi.object({
-  survey: Joi.string().required().min(1),
-  questions: Joi.when('dismissed', {
-    is: false,
-    then: Joi.array()
-      .items(
-        Joi.object({
-          text: Joi.string().min(1).required(),
-          answer: Joi.alternatives()
-            .try(
-              Joi.string().min(1).max(200),
-              Joi.array().items(Joi.string().min(1).max(200)),
-              null
-            )
-            .required(),
-        })
-      )
-      .required()
-      .min(1),
-  }),
-  dismissed: Joi.boolean().optional(),
-  url: Joi.string().uri().required(),
-  shownAt: Joi.string().isoDate().required(),
-  originalText: Joi.string().optional(),
-});
-
-const schemaOptions = {
-  abortEarly: false,
-  stripUnknown: true,
+const routers = {
+  boilerplate: require('../../boilerplate/backend/'),
+  cspReport: require('@lib/routers/cspReport.js'),
+  survey: require('@lib/routers/surveyComponent.js'),
+  example: {
+    api: require('@examples'),
+    embeds: require('@lib/routers/example/embeds.js'),
+    sources: require('@lib/routers/example/sources.js'),
+    static: require('@lib/routers/example/static.js'),
+    experiments: require('@lib/routers/example/experiments.js'),
+    inline: require('@lib/routers/inlineExamples.js'),
+  },
+  go: require('@lib/routers/go.js'),
+  growPages: require('@lib/routers/growPages.js').growPages,
+  growSharedPages: require('@lib/routers/growSharedPages.js'),
+  growXmls: require('@lib/routers/growXmls.js'),
+  healthCheck: require('@lib/routers/healthCheck.js').router,
+  log: require('@lib/routers/runtimeLog.js'),
+  notFound: require('@lib/routers/notFound.js'),
+  packager: require('@lib/routers/packager.js'),
+  pixi: require('../../pixi/backend/'),
+  playground: require('../../playground/backend/'),
+  search: require('@lib/routers/search.js'),
+  static: require('@lib/routers/static.js'),
+  templates: require('@lib/routers/templates.js'),
+  thumbor: require('@lib/routers/thumbor.js'),
+  whoAmI: require('@lib/routers/whoAmI.js'),
 };
 
-function validateRequest(req, res, next) {
-  if (req.method !== 'POST') {
-    return res.sendStatus(405);
-  }
+const HOST = config.hosts.platform.base;
+const PORT = config.hosts.platform.port || process.env.APP_PORT || 80;
 
-  const {error, value} = schema.validate(req.body, schemaOptions);
+class Platform {
+  start() {
+    log.info('Starting platform');
+    return new Promise(async (resolve, reject) => {
+      try {
+        await this._createServer();
+        this.httpServer = this.server.listen(PORT, () => {
+          log.success(`server listening on ${PORT}!`);
+          resolve();
+        });
 
-  if (error) {
-    res
-      .status(422)
-      .send(
-        `Validation error: ${error.details.map((x) => x.message).join(', ')}`
-      );
-  } else {
-    req.body = value;
-    next();
-  }
-}
+        webSocketServer.start(this.httpServer);
 
-async function getDoc() {
-  if (Doc === undefined) {
-    SURVEY_RESPONSE_SHEET_ID = await credentials.get(
-      'SURVEY_RESPONSE_SHEET_ID'
-    );
-    GOOGLE_SERVICE_ACCOUNT_EMAIL = await credentials.get(
-      'GOOGLE_SERVICE_ACCOUNT_EMAIL'
-    );
-    GOOGLE_PRIVATE_KEY = await credentials.get('GOOGLE_PRIVATE_KEY');
-
-    Doc = new GoogleSpreadsheet(SURVEY_RESPONSE_SHEET_ID);
-
-    await Doc.useServiceAccountAuth({
-      client_email: GOOGLE_SERVICE_ACCOUNT_EMAIL,
-      private_key: GOOGLE_PRIVATE_KEY,
+        // Increase keep alive timeout
+        // see https://cloud.google.com/load-balancing/docs/https/#timeouts_and_retries
+        this.httpServer.keepAliveTimeout = 700 * 1000;
+      } catch (err) {
+        reject(err);
+      }
     });
-
-    await Doc.loadInfo();
   }
 
-  return Doc;
-}
+  stop() {
+    log.info('Stopping platform');
+    return new Promise(async (resolve, reject) => {
+      this.httpServer.close(() => resolve());
+    });
+  }
 
-async function uploadAnswer(req, res) {
-  try {
-    const survey = req.body;
-    const doc = await getDoc();
-    let sheet = doc.sheetsByTitle[survey.survey];
+  async _createServer() {
+    log.await(
+      `Starting platform with environment ${config.environment} on ${HOST} ...`
+    );
+    this.server = express();
 
-    if (!sheet) {
-      sheet = await doc.addSheet({
-        title: survey.survey,
-        headerValues: [
-          survey.questions.map((q) => q.originalText || q.text),
-          'dismissed',
-          'url',
-          'shown at',
-        ].flat(),
+    // pass app engine HTTPS status to express app
+    this.server.set('trust proxy', true);
+    this.server.disable('x-powered-by');
+
+    this._configureMiddlewares();
+    await this._configureSubdomains();
+    this._configureRouters();
+    this._configureErrorHandlers();
+  }
+
+  _configureMiddlewares() {
+    this.server.use(shrinkRay());
+    this.server.use(require('./middleware/csp.js'));
+    this.server.use(require('./middleware/security.js'));
+    this.server.use(require('./middleware/redirects.js'));
+    this.server.use(require('./middleware/caching.js'));
+    this.server.use(
+      cors({
+        origin: true,
+        credentials: true,
+      })
+    );
+    this.server.use(
+      ampCors({
+        email: true,
+      })
+    );
+
+    // debug computing times
+    this.server.use((req, res, next) => {
+      const timeStart = process.hrtime();
+
+      res.on('finish', () => {
+        const timeElapsed = process.hrtime(timeStart);
+        let seconds = (timeElapsed[0] * 1000 + timeElapsed[1] / 1e6) / 1000;
+        seconds = seconds.toFixed(3);
+        const prefix = seconds > 1 ? 'CRITICAL_TIMING' : 'TIMING';
+        let postfix = `[${res.statusCode}]`;
+        if (req.header('amp-cache-transform')) {
+          postfix += ' [SXG]';
+        }
+        console.log(
+          `[${prefix}] ${req.get('host')}${
+            req.originalUrl
+          } ${seconds}s ${postfix}`
+        );
       });
-    }
 
-    const row = {
-      'dismissed': !!survey.dismissed,
-      'url': survey.url,
-      'shown at': survey.shownAt,
-    };
-
-    survey.questions.forEach((q) => {
-      const text = q.originalText || q.text;
-      const answer = Array.isArray(q.answer) ? q.answer.join('\n') : q.answer;
-      row[text] = answer;
+      next();
     });
+  }
 
-    await sheet.addRow(row);
-    await sheet.saveUpdatedCells();
-    log.complete(`saved response for ${survey.survey}`);
+  async _configureSubdomains() {
+    this.server.use(
+      await subdomain.map(config.hosts.playground, routers.playground)
+    );
+    this.server.use(await subdomain.map(config.hosts.go, routers.go));
+    this.server.use(await subdomain.map(config.hosts.log, routers.log));
+    this.server.use(
+      await subdomain.map(
+        config.hosts.preview,
+        express
+          .Router() // eslint-disable-line new-cap
+          .use([
+            routers.example.api,
+            routers.example.static,
+            routers.example.embeds,
+            routers.example.sources,
+            routers.example.experiments,
+            routers.example.inline,
+          ])
+      )
+    );
+  }
 
-    res.sendStatus(200);
-  } catch (error) {
-    log.error(error);
-    res.sendStatus(500);
+  _configureRouters() {
+    this.server.use(routers.cspReport);
+    this.server.use(routers.survey);
+    this.server.use(routers.packager);
+    this.server.use(routers.thumbor);
+    this.server.use(routers.whoAmI);
+    this.server.use(routers.healthCheck);
+    this.server.use(routers.example.api);
+    this.server.use(routers.pixi);
+    this.server.use(routers.search);
+    this.server.use(routers.boilerplate);
+    this.server.use(routers.static);
+    this.server.use(routers.templates);
+    // XMLs rendered by Grow as well as all pages located under /shared
+    // are need to be served by specialized routers instead of the generic one.
+    // Therefore register them first
+    this.server.use(routers.growSharedPages);
+    this.server.use(routers.growXmls);
+    // Register the following router at last as it works as a catch-all
+    this.server.use(routers.growPages);
+  }
+
+  _configureErrorHandlers() {
+    // handle errors
+    // eslint-disable-next-line no-unused-vars
+    this.server.use((err, req, res, next) => {
+      if (err) {
+        console.error('[ERROR]', err);
+        res.status(500).sendFile('500.html', {root: pagePath()});
+      }
+    });
+    // handle 404s
+    this.server.use(routers.notFound);
   }
 }
 
-// eslint-disable-next-line new-cap
-const surveyResponseRouter = express.Router();
-
-surveyResponseRouter.use(surveyEndpoint, express.json());
-
-surveyResponseRouter.all(surveyEndpoint, validateRequest, uploadAnswer);
-
-module.exports = surveyResponseRouter;
+module.exports = Platform;
